@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: ordscn-exotel-voice
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r ordscn_voice_requirements.txt
+    startCommand: uvicorn ordscn_voice_app:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: EXOTEL_STREAM_USER
+        sync: false
+      - key: EXOTEL_STREAM_PASS
+        sync: false
+      - key: ORDSCN_VOICE_MODEL
+        value: gpt-4.1-mini
+      - key: ORDSCN_STT_MODEL
+        value: gpt-4o-mini-transcribe
+      - key: ORDSCN_TTS_MODEL
+        value: gpt-4o-mini-tts
+      - key: ORDSCN_TTS_VOICE
+        value: alloy
