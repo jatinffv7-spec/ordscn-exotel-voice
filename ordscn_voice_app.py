@@ -1,4 +1,3 @@
-
 import os
 import json
 import base64
@@ -13,14 +12,17 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from openai import OpenAI
 
 
+# ------------------------------------------------------------
+# Logging and configuration
+# ------------------------------------------------------------
+
 logging.basicConfig(
     level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
-
 log = logging.getLogger("ordscn-voice")
-app = FastAPI(title="OrderScan Exotel Voicebot")
 
+app = FastAPI(title="OrderScan Exotel Voicebot")
 client = OpenAI() if os.getenv("OPENAI_API_KEY") else None
 
 CHAT_MODEL = os.getenv("ORDSCN_VOICE_MODEL", "gpt-4.1-mini")
@@ -38,59 +40,68 @@ SPEECH_RMS_THRESHOLD = int(os.getenv("ORDSCN_SPEECH_RMS_THRESHOLD", "180"))
 
 RATE = 8000
 BYTES_PER_MS = 16
+OUTGOING_CHUNK_BYTES = 3200
 
 
-def pcm_rms(buf):
-    n = len(buf) // 2
-    if not n:
+# ------------------------------------------------------------
+# Audio helpers
+# ------------------------------------------------------------
+
+def pcm_rms(buf: bytes) -> int:
+    sample_count = len(buf) // 2
+    if sample_count == 0:
         return 0
 
-    vals = struct.unpack("<%dh" % n, buf[:n * 2])
-    return int(math.sqrt(sum(v * v for v in vals) / n))
+    values = struct.unpack("<%dh" % sample_count, buf[:sample_count * 2])
+    return int(math.sqrt(sum(value * value for value in values) / sample_count))
 
 
-def wav_bytes(pcm):
-    out = BytesIO()
-
-    with wave.open(out, "wb") as w:
-        w.setnchannels(1)
-        w.setsampwidth(2)
-        w.setframerate(RATE)
-        w.writeframes(pcm)
-
-    return out.getvalue()
+def wav_bytes(pcm: bytes) -> bytes:
+    output = BytesIO()
+    with wave.open(output, "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(RATE)
+        wav_file.writeframes(pcm)
+    return output.getvalue()
 
 
-def resample_24k_to_8k(data):
-    n = len(data) // 2
-    if n < 3:
+def resample_24k_to_8k(data: bytes) -> bytes:
+    """Convert 24 kHz signed 16-bit mono PCM to 8 kHz signed 16-bit mono PCM."""
+    sample_count = len(data) // 2
+    if sample_count < 3:
         return b""
 
-    samples = struct.unpack("<%dh" % n, data[:n * 2])
+    samples = struct.unpack("<%dh" % sample_count, data[:sample_count * 2])
+    output = []
 
-    out = [
-        max(-32768, min(32767, int(sum(samples[i:i + 3]) / 3)))
-        for i in range(0, (n // 3) * 3, 3)
-    ]
+    for index in range(0, (sample_count // 3) * 3, 3):
+        average = int(sum(samples[index:index + 3]) / 3)
+        output.append(max(-32768, min(32767, average)))
 
-    return struct.pack("<%dh" % len(out), *out) if out else b""
+    if not output:
+        return b""
+
+    return struct.pack("<%dh" % len(output), *output)
 
 
-def audio_chunks(data, size=3200):
+def audio_chunks(data: bytes, size: int = OUTGOING_CHUNK_BYTES):
+    """Yield PCM chunks aligned to 320-byte boundaries."""
     size = max(3200, min(100000, size))
     size -= size % 320
 
-    usable = len(data) - len(data) % 320
-
-    # Keep every transmitted chunk aligned to 320 bytes.
-    for i in range(0, usable, size):
-        part = data[i:min(i + size, usable)]
-
+    usable_length = len(data) - (len(data) % 320)
+    for offset in range(0, usable_length, size):
+        part = data[offset:min(offset + size, usable_length)]
         if len(part) >= 320:
             yield part
 
 
-def authorized(ws):
+# ------------------------------------------------------------
+# Authentication and health endpoints
+# ------------------------------------------------------------
+
+def authorized(ws: WebSocket) -> bool:
     import base64 as b64
 
     expected = "Basic " + b64.b64encode(
@@ -113,7 +124,7 @@ async def health():
         "openai_configured": client is not None,
         "websocket_path": "/media",
         "audio_format": "pcm_s16le_8000_mono",
-        "speech_rms_threshold": SPEECH_RMS_THRESHOLD
+        "speech_rms_threshold": SPEECH_RMS_THRESHOLD,
     }
 
 
@@ -121,15 +132,14 @@ async def health():
 async def ready():
     if client is None:
         raise HTTPException(503, "OPENAI_API_KEY is missing")
-
     if not AUTH_USER or not AUTH_PASS:
-        raise HTTPException(
-            503,
-            "Exotel WebSocket Basic Auth is not configured"
-        )
-
+        raise HTTPException(503, "Exotel WebSocket Basic Auth is not configured")
     return {"ok": True}
 
+
+# ------------------------------------------------------------
+# Order conversation instructions
+# ------------------------------------------------------------
 
 SYSTEM_PROMPT = """You are OrderScan's outbound pharmacy-order AI assistant.
 Identify yourself as an AI calling on behalf of the supplier.
@@ -155,62 +165,61 @@ Keep replies short and ask one question at a time.
 
 Return JSON only:
 {
-  "reply": string,
+  "reply": "short spoken reply",
   "intent": "continue|finish|opt_out|wrong_person",
   "items": [
     {
-      "product_text": string,
-      "quantity_text": string
+      "product_text": "as spoken",
+      "quantity_text": "as spoken"
     }
   ],
-  "notes": [string]
+  "notes": ["optional note"]
 }
 """
 
 
-async def transcribe(pcm):
+# ------------------------------------------------------------
+# OpenAI functions
+# ------------------------------------------------------------
+
+async def transcribe(pcm: bytes) -> str:
     wav = wav_bytes(pcm)
 
     def run():
         return client.audio.transcriptions.create(
             model=STT_MODEL,
-            file=("caller.wav", wav, "audio/wav")
+            file=("caller.wav", wav, "audio/wav"),
         )
 
     result = await asyncio.to_thread(run)
-
     return (getattr(result, "text", "") or "").strip()
 
 
-async def make_reply(history, transcript, meta):
+async def make_reply(history, transcript: str, meta: dict) -> dict:
     payload = {
         "call": {
             "call_sid": meta.get("call_sid", ""),
             "from": meta.get("from", ""),
-            "to": meta.get("to", "")
+            "to": meta.get("to", ""),
         },
         "recent_conversation": history[-12:],
-        "caller_said": transcript
+        "caller_said": transcript,
     }
 
     def run():
-        r = client.chat.completions.create(
+        response = client.chat.completions.create(
             model=CHAT_MODEL,
             temperature=0.2,
             response_format={"type": "json_object"},
             messages=[
-                {
-                    "role": "system",
-                    "content": SYSTEM_PROMPT
-                },
+                {"role": "system", "content": SYSTEM_PROMPT},
                 {
                     "role": "user",
-                    "content": json.dumps(payload, ensure_ascii=False)
-                }
-            ]
+                    "content": json.dumps(payload, ensure_ascii=False),
+                },
+            ],
         )
-
-        return json.loads(r.choices[0].message.content)
+        return json.loads(response.choices[0].message.content)
 
     data = await asyncio.to_thread(run)
 
@@ -220,70 +229,146 @@ async def make_reply(history, transcript, meta):
     return data
 
 
-async def speak(ws, text, stream_sid, seq):
-    def synth():
-        r = client.audio.speech.create(
+async def synthesize_pcm_8k(text: str) -> bytes:
+    def run():
+        response = client.audio.speech.create(
             model=TTS_MODEL,
             voice=TTS_VOICE,
             input=text,
-            response_format="pcm"
+            response_format="pcm",
+        )
+        return response.read()
+
+    pcm_24k = await asyncio.to_thread(run)
+    return resample_24k_to_8k(pcm_24k)
+
+
+# ------------------------------------------------------------
+# Exotel outbound audio
+#
+# Important protocol detail:
+# Exotel's documented bot -> Exotel media message contains:
+# event, stream_sid, and media.payload.
+# Do not add inbound-only sequence_number/chunk/timestamp fields.
+# ------------------------------------------------------------
+
+async def send_speech(ws: WebSocket, text: str, stream_sid: str, state: dict):
+    if state.get("send_task") is not None:
+        old_task = state["send_task"]
+        if not old_task.done():
+            log.warning("Previous TTS task still running; not starting another")
+            return
+
+    state["tts_active"] = True
+    mark_name = f"orderscan-{state['turn_number']}-done"
+    mark_event = asyncio.Event()
+    state["expected_mark"] = mark_name
+    state["mark_event"] = mark_event
+
+    try:
+        log.info(
+            "TTS generation starting stream=%s turn=%s chars=%d",
+            stream_sid,
+            state["turn_number"],
+            len(text),
         )
 
-        return r.read()
+        pcm_8k = await synthesize_pcm_8k(text)
+        if not pcm_8k:
+            raise ValueError("TTS returned empty audio")
 
-    pcm8 = resample_24k_to_8k(
-        await asyncio.to_thread(synth)
-    )
+        duration = len(pcm_8k) / (RATE * 2)
+        chunks = list(audio_chunks(pcm_8k))
 
-    if not pcm8:
-        raise ValueError("TTS returned empty audio")
+        log.info(
+            "TTS generated stream=%s bytes=%d duration_seconds=%.2f chunks=%d",
+            stream_sid,
+            len(pcm_8k),
+            duration,
+            len(chunks),
+        )
 
-    duration = len(pcm8) / (RATE * 2)
-    chunk_no = 0
+        loop = asyncio.get_running_loop()
+        state["speaking_until"] = loop.time() + duration + 2.0
 
-    # Send audio chunks at approximately real-time playback speed.
-    for part in audio_chunks(pcm8):
-        chunk_no += 1
-        seq += 1
-
-        await ws.send_json({
-            "event": "media",
-            "sequence_number": seq,
-            "stream_sid": stream_sid,
-            "media": {
-                "chunk": chunk_no,
-                "timestamp": str((chunk_no - 1) * 200),
-                "payload": base64.b64encode(part).decode()
+        for chunk_number, part in enumerate(chunks, start=1):
+            # This is the documented bot -> Exotel media message shape.
+            message = {
+                "event": "media",
+                "stream_sid": stream_sid,
+                "media": {
+                    "payload": base64.b64encode(part).decode("ascii"),
+                },
             }
+
+            log.info(
+                "TTS media send begin stream=%s chunk=%d/%d bytes=%d",
+                stream_sid,
+                chunk_number,
+                len(chunks),
+                len(part),
+            )
+
+            await ws.send_json(message)
+
+            log.info(
+                "TTS media send ok stream=%s chunk=%d/%d",
+                stream_sid,
+                chunk_number,
+                len(chunks),
+            )
+
+            # 8 kHz * 16-bit mono = 16,000 bytes per second.
+            # Pace according to the actual PCM duration of this chunk.
+            await asyncio.sleep(len(part) / (RATE * 2))
+
+        # Send a mark after all audio chunks. Exotel echoes it after playback.
+        await ws.send_json({
+            "event": "mark",
+            "stream_sid": stream_sid,
+            "mark": {"name": mark_name},
         })
 
-        # 16-bit mono PCM: 2 bytes per sample.
-        # At 8000 samples/second, 3200 bytes = 200 ms? 
-        # The actual duration is calculated from the chunk length.
-        await asyncio.sleep(len(part) / (RATE * 2))
+        log.info(
+            "TTS all chunks sent stream=%s chunks=%d duration_seconds=%.2f mark=%s",
+            stream_sid,
+            len(chunks),
+            duration,
+            mark_name,
+        )
 
-    seq += 1
-    mark_name = f"reply-{seq}"
+        # The receive loop remains active while this task waits for the mark.
+        try:
+            await asyncio.wait_for(mark_event.wait(), timeout=5.0)
+            log.info("TTS playback mark confirmed stream=%s mark=%s", stream_sid, mark_name)
+        except asyncio.TimeoutError:
+            log.warning(
+                "TTS playback mark timeout stream=%s mark=%s; continuing after audio send",
+                stream_sid,
+                mark_name,
+            )
 
-    await ws.send_json({
-        "event": "mark",
-        "sequence_number": seq,
-        "stream_sid": stream_sid,
-        "mark": {
-            "name": mark_name
-        }
-    })
+    except asyncio.CancelledError:
+        log.warning("TTS task cancelled stream=%s", stream_sid)
+        raise
+    except Exception:
+        log.exception("TTS send failed stream=%s", stream_sid)
+    finally:
+        state["tts_active"] = False
+        state["expected_mark"] = None
+        state["mark_event"] = None
+        state["speaking_until"] = 0.0
 
-    log.info(
-        "TTS sent stream=%s chars=%d audio_seconds=%.2f mark=%s",
-        stream_sid,
-        len(text),
-        duration,
-        mark_name
-    )
 
-    return seq, duration
+def start_speech_task(ws: WebSocket, text: str, stream_sid: str, state: dict):
+    task = asyncio.create_task(send_speech(ws, text, stream_sid, state))
+    state["send_task"] = task
+    return task
 
+
+# ------------------------------------------------------------
+# Main Exotel WebSocket
+# ------------------------------------------------------------
 
 @app.websocket("/media")
 async def media(ws: WebSocket):
@@ -300,62 +385,60 @@ async def media(ws: WebSocket):
         return
 
     stream_sid = ""
-    seq = 1
     meta = {}
-
     history = []
-    audio = bytearray()
+    audio_buffer = bytearray()
 
     silence_ms = 0
     speech_ms = 0
     media_count = 0
-
-    speaking_until = 0.0
-    expected_mark = None
-
-    started = asyncio.get_running_loop().time()
-    last_diag = started
     peak_rms = 0
+
+    loop = asyncio.get_running_loop()
+    call_started_at = loop.time()
+    last_diagnostic_at = call_started_at
+
+    state = {
+        "tts_active": False,
+        "speaking_until": 0.0,
+        "expected_mark": None,
+        "mark_event": None,
+        "send_task": None,
+        "turn_number": 0,
+    }
 
     try:
         async for raw in ws.iter_text():
-            now = asyncio.get_running_loop().time()
+            now = loop.time()
 
-            if now - started > MAX_SECONDS:
-                log.info(
-                    "Maximum call duration reached stream=%s",
-                    stream_sid
-                )
+            if now - call_started_at > MAX_SECONDS:
+                log.info("Maximum call duration reached stream=%s", stream_sid)
                 break
 
             try:
-                msg = json.loads(raw)
+                message = json.loads(raw)
             except Exception:
                 log.warning("Received non-JSON WebSocket message")
                 continue
 
-            event = msg.get("event", "")
+            event = message.get("event", "")
 
             if event == "connected":
                 log.info(
-                    "Exotel connected stream=%s",
-                    msg.get("stream_sid", "")
+                    "Exotel connected event stream=%s",
+                    message.get("stream_sid", ""),
                 )
                 continue
 
             if event == "start":
-                st = msg.get("start") or {}
-
-                stream_sid = (
-                    msg.get("stream_sid")
-                    or st.get("stream_sid", "")
-                )
+                start_data = message.get("start") or {}
+                stream_sid = message.get("stream_sid") or start_data.get("stream_sid", "")
 
                 meta = {
-                    "call_sid": st.get("call_sid", ""),
-                    "from": st.get("from", ""),
-                    "to": st.get("to", ""),
-                    "custom_parameters": st.get("custom_parameters", {})
+                    "call_sid": start_data.get("call_sid", ""),
+                    "from": start_data.get("from", ""),
+                    "to": start_data.get("to", ""),
+                    "custom_parameters": start_data.get("custom_parameters", {}),
                 }
 
                 log.info(
@@ -364,7 +447,7 @@ async def media(ws: WebSocket):
                     meta.get("from"),
                     meta.get("to"),
                     stream_sid,
-                    st.get("media_format")
+                    start_data.get("media_format"),
                 )
 
                 greeting = (
@@ -373,62 +456,34 @@ async def media(ws: WebSocket):
                     "Aap bol sakte hain, main sun rahi hoon."
                 )
 
-                history.append({
-                    "role": "assistant",
-                    "content": greeting
-                })
-
-                seq, duration = await speak(
-                    ws,
-                    greeting,
-                    stream_sid,
-                    seq
-                )
-
-                speaking_until = (
-                    asyncio.get_running_loop().time()
-                    + duration
-                    + 0.6
-                )
-
-                expected_mark = f"reply-{seq}"
+                history.append({"role": "assistant", "content": greeting})
+                state["turn_number"] = 1
+                start_speech_task(ws, greeting, stream_sid, state)
                 continue
 
             if event == "mark":
-                mark = (msg.get("mark") or {}).get("name", "")
+                mark_name = (message.get("mark") or {}).get("name", "")
+                log.info("Playback mark received stream=%s mark=%s", stream_sid, mark_name)
 
-                log.info(
-                    "Playback mark received stream=%s mark=%s",
-                    stream_sid,
-                    mark
-                )
-
-                if not expected_mark or mark == expected_mark:
-                    speaking_until = min(
-                        speaking_until,
-                        asyncio.get_running_loop().time()
-                    )
-
-                    expected_mark = None
-
+                if (
+                    state.get("expected_mark") == mark_name
+                    and state.get("mark_event") is not None
+                ):
+                    state["mark_event"].set()
                 continue
 
             if event == "clear":
                 log.info("Exotel clear event stream=%s", stream_sid)
-
-                speaking_until = 0
-                expected_mark = None
-                audio.clear()
+                audio_buffer.clear()
                 silence_ms = 0
                 speech_ms = 0
-
                 continue
 
             if event == "dtmf":
                 log.info(
                     "DTMF received stream=%s digit=%s",
                     stream_sid,
-                    (msg.get("dtmf") or {}).get("digit", "")
+                    (message.get("dtmf") or {}).get("digit", ""),
                 )
                 continue
 
@@ -436,64 +491,54 @@ async def media(ws: WebSocket):
                 log.info(
                     "Exotel stop event stream=%s detail=%s",
                     stream_sid,
-                    msg.get("stop")
+                    message.get("stop"),
                 )
                 break
 
             if event != "media":
-                log.info(
-                    "Other Exotel event stream=%s event=%s",
-                    stream_sid,
-                    event
-                )
+                log.info("Other Exotel event stream=%s event=%s", stream_sid, event)
                 continue
 
             media_count += 1
 
             try:
                 part = base64.b64decode(
-                    (msg.get("media") or {}).get("payload", ""),
-                    validate=True
+                    (message.get("media") or {}).get("payload", ""),
+                    validate=True,
                 )
             except Exception:
-                log.warning(
-                    "Invalid media base64 stream=%s",
-                    stream_sid
-                )
+                log.warning("Invalid media base64 stream=%s", stream_sid)
                 continue
 
             part = part[:len(part) - (len(part) % 2)]
-
             if not part:
                 continue
 
             rms = pcm_rms(part)
             peak_rms = max(peak_rms, rms)
 
-            # Ignore playback echo only for the estimated TTS duration.
-            # After that, accept caller audio even if Exotel never echoes mark.
-            if now < speaking_until:
+            # Do not mistake the bot's own playback/echo for caller speech.
+            if state["tts_active"] or now < state["speaking_until"]:
                 if media_count % 50 == 0:
                     log.info(
-                        "Media during TTS stream=%s frames=%d rms=%d",
+                        "Caller media ignored during TTS stream=%s frames=%d rms=%d",
                         stream_sid,
                         media_count,
-                        rms
+                        rms,
                     )
                 continue
 
-            duration_ms = max(1, len(part) // 16)
+            duration_ms = max(1, len(part) // BYTES_PER_MS)
 
             if rms >= SPEECH_RMS_THRESHOLD:
-                audio.extend(part)
+                audio_buffer.extend(part)
                 speech_ms += duration_ms
                 silence_ms = 0
-
             elif speech_ms:
-                audio.extend(part)
+                audio_buffer.extend(part)
                 silence_ms += duration_ms
 
-            if media_count % 50 == 0 or now - last_diag >= 5:
+            if media_count % 50 == 0 or now - last_diagnostic_at >= 5:
                 log.info(
                     "Audio diagnostic stream=%s frames=%d rms=%d peak=%d speech_ms=%d silence_ms=%d bytes=%d",
                     stream_sid,
@@ -502,17 +547,15 @@ async def media(ws: WebSocket):
                     peak_rms,
                     speech_ms,
                     silence_ms,
-                    len(audio)
+                    len(audio_buffer),
                 )
-
-                last_diag = now
+                last_diagnostic_at = now
 
             if speech_ms >= MIN_SPEECH_MS and silence_ms >= SILENCE_MS:
-                utterance = bytes(audio)
-                audio.clear()
+                utterance = bytes(audio_buffer)
+                audio_buffer.clear()
 
                 captured_speech_ms = speech_ms
-
                 silence_ms = 0
                 speech_ms = 0
                 peak_rms = 0
@@ -521,128 +564,69 @@ async def media(ws: WebSocket):
                     "Utterance captured stream=%s bytes=%d speech_ms=%d",
                     stream_sid,
                     len(utterance),
-                    captured_speech_ms
+                    captured_speech_ms,
                 )
 
-                text = ""
-                answer = {}
-
                 try:
-                    text = await transcribe(utterance)
+                    transcript = await transcribe(utterance)
 
-                    if not text:
+                    if not transcript:
                         reply = (
                             "Maaf kijiye, awaaz clear nahi aayi. "
                             "Kripya ek baar phir boliye."
                         )
-
-                        history.append({
-                            "role": "assistant",
-                            "content": reply
-                        })
-
+                        history.append({"role": "assistant", "content": reply})
                     else:
                         log.info(
                             "Caller transcription call_sid=%s text=%s",
                             meta.get("call_sid", ""),
-                            text[:400]
+                            transcript[:400],
                         )
+                        history.append({"role": "user", "content": transcript})
 
-                        history.append({
-                            "role": "user",
-                            "content": text
-                        })
-
-                        answer = await make_reply(
-                            history,
-                            text,
-                            meta
-                        )
-
+                        answer = await make_reply(history, transcript, meta)
                         reply = answer["reply"].strip()
-
-                        history.append({
-                            "role": "assistant",
-                            "content": reply
-                        })
+                        history.append({"role": "assistant", "content": reply})
 
                         log.info(
                             "Assistant reply call_sid=%s intent=%s text=%s",
                             meta.get("call_sid", ""),
                             answer.get("intent", "continue"),
-                            reply[:400]
+                            reply[:400],
                         )
 
-                    seq, duration = await speak(
-                        ws,
-                        reply,
-                        stream_sid,
-                        seq
-                    )
-
-                    speaking_until = (
-                        asyncio.get_running_loop().time()
-                        + duration
-                        + 0.6
-                    )
-
-                    expected_mark = f"reply-{seq}"
-
-                    if answer.get("intent") in (
-                        "finish",
-                        "opt_out",
-                        "wrong_person"
-                    ):
-                        log.info(
-                            "Conversation intent=%s call=%s",
-                            answer.get("intent"),
-                            meta.get("call_sid", "")
-                        )
+                    state["turn_number"] += 1
+                    start_speech_task(ws, reply, stream_sid, state)
 
                 except Exception:
-                    log.exception(
-                        "Voice turn failed stream=%s",
-                        stream_sid
-                    )
-
+                    log.exception("Voice turn failed stream=%s", stream_sid)
                     fallback = (
                         "Maaf kijiye, thodi technical dikkat aa gayi. "
                         "Kripya apni baat ek baar phir batayein."
                     )
-
-                    seq, duration = await speak(
-                        ws,
-                        fallback,
-                        stream_sid,
-                        seq
-                    )
-
-                    speaking_until = (
-                        asyncio.get_running_loop().time()
-                        + duration
-                        + 0.6
-                    )
-
-                    expected_mark = f"reply-{seq}"
+                    state["turn_number"] += 1
+                    start_speech_task(ws, fallback, stream_sid, state)
 
     except WebSocketDisconnect:
-        log.info(
-            "WebSocket disconnected stream=%s",
-            stream_sid
-        )
-
+        log.info("WebSocket disconnected stream=%s", stream_sid)
     except Exception:
-        log.exception(
-            "WebSocket session error stream=%s",
-            stream_sid
-        )
-
+        log.exception("WebSocket session error stream=%s", stream_sid)
     finally:
+        send_task = state.get("send_task")
+        if send_task is not None and not send_task.done():
+            send_task.cancel()
+            try:
+                await send_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                log.exception("Error while cleaning up TTS task stream=%s", stream_sid)
+
         # Draft-only pilot: deliberately no order submission or persistence.
         log.info(
             "Call ended call_sid=%s stream=%s turns=%d media_frames=%d",
             meta.get("call_sid", ""),
             stream_sid,
             len(history),
-            media_count
+            media_count,
         )
