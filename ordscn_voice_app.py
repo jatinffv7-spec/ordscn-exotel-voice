@@ -253,11 +253,13 @@ async def synthesize_pcm_8k(text: str) -> bytes:
 # ------------------------------------------------------------
 
 async def send_speech(ws: WebSocket, text: str, stream_sid: str, state: dict):
-    if state.get("send_task") is not None:
-        old_task = state["send_task"]
-        if not old_task.done():
-            log.warning("Previous TTS task still running; not starting another")
-            return
+    # start_speech_task stores this task in state before it begins running.
+    # Therefore, do not mistake this task itself for a previous active task.
+    current_task = asyncio.current_task()
+    old_task = state.get("send_task")
+    if old_task is not None and old_task is not current_task and not old_task.done():
+        log.warning("Previous TTS task still running; not starting another")
+        return
 
     state["tts_active"] = True
     mark_name = f"orderscan-{state['turn_number']}-done"
