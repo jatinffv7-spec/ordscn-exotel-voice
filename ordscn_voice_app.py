@@ -6,6 +6,8 @@ import logging
 import wave
 import struct
 import math
+import urllib.request
+import urllib.error
 from io import BytesIO
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
@@ -32,6 +34,10 @@ TTS_VOICE = os.getenv("ORDSCN_TTS_VOICE", "alloy")
 
 AUTH_USER = os.getenv("EXOTEL_STREAM_USER", "")
 AUTH_PASS = os.getenv("EXOTEL_STREAM_PASS", "")
+
+# Optional secure callback to the OrderScan Transcript Inbox.
+TRANSCRIPT_URL = os.getenv("VOICE_TRANSCRIPT_URL", "").strip()
+TRANSCRIPT_SECRET = os.getenv("VOICE_TRANSCRIPT_SECRET", "").strip()
 
 MAX_SECONDS = int(os.getenv("ORDSCN_MAX_CALL_SECONDS", "900"))
 SILENCE_MS = int(os.getenv("ORDSCN_SILENCE_MS", "700"))
@@ -253,13 +259,11 @@ async def synthesize_pcm_8k(text: str) -> bytes:
 # ------------------------------------------------------------
 
 async def send_speech(ws: WebSocket, text: str, stream_sid: str, state: dict):
-    # start_speech_task stores this task in state before it begins running.
-    # Therefore, do not mistake this task itself for a previous active task.
-    current_task = asyncio.current_task()
-    old_task = state.get("send_task")
-    if old_task is not None and old_task is not current_task and not old_task.done():
-        log.warning("Previous TTS task still running; not starting another")
-        return
+    if state.get("send_task") is not None:
+        old_task = state["send_task"]
+        if not old_task.done():
+            log.warning("Previous TTS task still running; not starting another")
+            return
 
     state["tts_active"] = True
     mark_name = f"orderscan-{state['turn_number']}-done"
@@ -368,6 +372,23 @@ def start_speech_task(ws: WebSocket, text: str, stream_sid: str, state: dict):
     return task
 
 
+def send_transcript_record(record: dict) -> None:
+    """Send one completed call record to the private OrderScan PHP inbox."""
+    if not TRANSCRIPT_URL or not TRANSCRIPT_SECRET:
+        log.info("Transcript callback skipped: VOICE_TRANSCRIPT_URL/VOICE_TRANSCRIPT_SECRET not configured")
+        return
+    body = json.dumps(record, ensure_ascii=False).encode("utf-8")
+    request = urllib.request.Request(
+        TRANSCRIPT_URL, data=body, method="POST",
+        headers={"Content-Type": "application/json", "X-Voice-Secret": TRANSCRIPT_SECRET},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=12) as response:
+            log.info("Transcript callback completed status=%s call_sid=%s", response.status, record.get("call_sid"))
+    except Exception:
+        log.exception("Transcript callback failed call_sid=%s", record.get("call_sid"))
+
+
 # ------------------------------------------------------------
 # Main Exotel WebSocket
 # ------------------------------------------------------------
@@ -389,6 +410,8 @@ async def media(ws: WebSocket):
     stream_sid = ""
     meta = {}
     history = []
+    extracted_items = []
+    call_started_iso = ""
     audio_buffer = bytearray()
 
     silence_ms = 0
@@ -442,6 +465,7 @@ async def media(ws: WebSocket):
                     "to": start_data.get("to", ""),
                     "custom_parameters": start_data.get("custom_parameters", {}),
                 }
+                call_started_iso = __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat()
 
                 log.info(
                     "Call started call_sid=%s from=%s to=%s stream=%s media_format=%s",
@@ -587,6 +611,10 @@ async def media(ws: WebSocket):
                         history.append({"role": "user", "content": transcript})
 
                         answer = await make_reply(history, transcript, meta)
+                        items = answer.get("items", [])
+                        if isinstance(items, list):
+                            for item in items[:20]:
+                                if isinstance(item, dict): extracted_items.append(item)
                         reply = answer["reply"].strip()
                         history.append({"role": "assistant", "content": reply})
 
@@ -624,11 +652,34 @@ async def media(ws: WebSocket):
             except Exception:
                 log.exception("Error while cleaning up TTS task stream=%s", stream_sid)
 
-        # Draft-only pilot: deliberately no order submission or persistence.
+        # Send a transcript draft only. This never creates or submits an OrderScan order.
+        if meta.get("call_sid") and history:
+            custom = meta.get("custom_parameters") or {}
+            if not isinstance(custom, dict): custom = {}
+            customer_id = str(custom.get("customer_id", custom.get("customerId", "")))
+            # For outbound calls Exotel's 'to' is the customer; for inbound calls 'from' is the caller.
+            customer_phone = str(meta.get("to") or meta.get("from") or "")
+            transcript_text = "\n".join(
+                ("Customer: " if turn.get("role") == "user" else "AI: ") + str(turn.get("content", ""))
+                for turn in history if isinstance(turn, dict)
+            )
+            record = {
+                "call_sid": str(meta.get("call_sid", "")),
+                "customer_id": customer_id,
+                "customer_name": str(custom.get("customer_name", "")),
+                "phone": customer_phone,
+                "call_started_at": call_started_iso,
+                "outcome": "completed_or_disconnected",
+                "transcript": transcript_text[:100000],
+                "items": extracted_items[:50],
+                "notes": "AI-extracted items are suggestions only. Staff must verify before manually creating an order.",
+            }
+            try:
+                await asyncio.to_thread(send_transcript_record, record)
+            except Exception:
+                log.exception("Could not deliver transcript call_sid=%s", meta.get("call_sid", ""))
+
         log.info(
             "Call ended call_sid=%s stream=%s turns=%d media_frames=%d",
-            meta.get("call_sid", ""),
-            stream_sid,
-            len(history),
-            media_count,
+            meta.get("call_sid", ""), stream_sid, len(history), media_count,
         )
