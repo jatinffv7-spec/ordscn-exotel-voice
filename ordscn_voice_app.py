@@ -252,7 +252,7 @@ async def speak(ws, text, stream_sid, seq):
             "stream_sid": stream_sid,
             "media": {
                 "chunk": chunk_no,
-                "timestamp": str((chunk_no - 1) * 100),
+                "timestamp": str((chunk_no - 1) * 200),
                 "payload": base64.b64encode(part).decode()
             }
         })
