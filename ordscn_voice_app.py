@@ -82,7 +82,7 @@ async def exotel_resolve(request: Request):
     if not call_sid or not call_to:
         raise HTTPException(400, "Missing Exotel CallSid or CallTo")
     # Exotel documents a maximum of three custom stream parameters.
-    params = {"sample-rate": "8000", "customer_phone": call_to,
+    params = {"sample-rate": "8000", "customer_phone": call_from,
               "exotel_call_sid": call_sid, "customer_from": call_from}
     ws_base = os.getenv("EXOTEL_MEDIA_WSS_URL", "wss://ordscn-exotel-voicebot.onrender.com/media")
     parts = urlsplit(ws_base)
@@ -188,9 +188,9 @@ async def media(ws: WebSocket):
                 meta = {"call_sid": st.get("call_sid", ""), "from": st.get("from", ""),
                         "to": st.get("to", ""), "custom_parameters": st.get("custom_parameters", {})}
                 cp = meta["custom_parameters"] if isinstance(meta["custom_parameters"], dict) else {}
-                meta["customer_phone"] = cp.get("customer_phone", meta.get("to", ""))
+                meta["customer_phone"] = cp.get("customer_phone") or meta.get("from", "")
                 meta["exotel_call_sid"] = cp.get("exotel_call_sid", meta.get("call_sid", ""))
-                meta["customer_from"] = cp.get("customer_from", meta.get("from", ""))
+                meta["customer_from"] = cp.get("customer_from") or meta.get("from", "")
                 log.info("Call started call_sid=%s from=%s to=%s stream=%s media_format=%s",
                          meta.get("call_sid"), meta.get("from"), meta.get("to"), stream_sid, st.get("media_format"))
                 greeting = ("Namaste! Main OrderScan ki AI assistant hoon. "
