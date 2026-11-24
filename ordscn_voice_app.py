@@ -155,6 +155,7 @@ async def speak(ws, text, stream_sid, seq):
 
 @app.websocket("/media")
 async def media(ws: WebSocket):
+    log.info("WebSocket request reached /media")
     if not authorized(ws):
         log.warning("Rejected WebSocket: Basic Auth missing or invalid")
         await ws.close(code=1008); return
