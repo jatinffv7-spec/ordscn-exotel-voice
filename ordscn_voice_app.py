@@ -135,22 +135,43 @@ async def make_reply(history, transcript, meta):
 
 async def speak(ws, text, stream_sid, seq):
     def synth():
-        r = client.audio.speech.create(model=TTS_MODEL, voice=TTS_VOICE, input=text, response_format="pcm")
+        r = client.audio.speech.create(
+            model=TTS_MODEL,
+            voice=TTS_VOICE,
+            input=text,
+            response_format="pcm"
+        )
         return r.read()
+
     pcm8 = resample_24k_to_8k(await asyncio.to_thread(synth))
-    if not pcm8: raise ValueError("TTS returned empty audio")
+    if not pcm8:
+        raise ValueError("TTS returned empty audio")
+
     duration = len(pcm8) / (RATE * 2)
-    chunk_no = 0
+
     for part in audio_chunks(pcm8):
-        chunk_no += 1; seq += 1
-        await ws.send_json({"event": "media", "sequence_number": seq, "stream_sid": stream_sid,
-                            "media": {"chunk": chunk_no,"timestamp": str(int((chunk_no - 1) * len(part) * 1000 / (RATE * 2))),
-                                      "payload": base64.b64encode(part).decode()}})
+        await ws.send_json({
+            "event": "media",
+            "stream_sid": stream_sid,
+            "media": {
+                "payload": base64.b64encode(part).decode("ascii")
+            }
+        })
+
     seq += 1
     mark_name = f"reply-{seq}"
-    await ws.send_json({"event": "mark", "sequence_number": seq, "stream_sid": stream_sid,
-                        "mark": {"name": mark_name}})
-    log.info("TTS sent stream=%s chars=%d audio_seconds=%.2f mark=%s", stream_sid, len(text), duration, mark_name)
+    await ws.send_json({
+        "event": "mark",
+        "stream_sid": stream_sid,
+        "mark": {
+            "name": mark_name
+        }
+    })
+
+    log.info(
+        "TTS sent stream=%s chars=%d audio_seconds=%.2f mark=%s",
+        stream_sid, len(text), duration, mark_name
+    )
     return seq, duration
 
 @app.websocket("/media")
