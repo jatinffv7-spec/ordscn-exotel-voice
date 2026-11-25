@@ -144,7 +144,7 @@ async def speak(ws, text, stream_sid, seq):
     for part in audio_chunks(pcm8):
         chunk_no += 1; seq += 1
         await ws.send_json({"event": "media", "sequence_number": seq, "stream_sid": stream_sid,
-                            "media": {"chunk": chunk_no, "timestamp": str((chunk_no-1)*100),
+                            "media": {"chunk": chunk_no,"timestamp": str(int((chunk_no - 1) * len(part) * 1000 / (RATE * 2))),
                                       "payload": base64.b64encode(part).decode()}})
     seq += 1
     mark_name = f"reply-{seq}"
